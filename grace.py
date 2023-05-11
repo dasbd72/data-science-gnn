@@ -14,6 +14,8 @@ from sklearn.multiclass import OneVsRestClassifier
 from sklearn.preprocessing import normalize, OneHotEncoder
 
 from tqdm import tqdm
+import math
+import random
 
 
 # === Graph Augmentation ==================================================================
@@ -155,6 +157,20 @@ class Grace(nn.Module):
         return ret.mean()
 
 
+def get_classifier(X_train, y_train_hot):
+    logreg = LogisticRegression(solver="liblinear")
+    c = 1.4 ** np.arange(-20, 20)
+    clf = GridSearchCV(
+        estimator=OneVsRestClassifier(logreg),
+        param_grid=dict(estimator__C=c),
+        n_jobs=8,
+        cv=10,
+        verbose=0,
+    )
+    clf.fit(X_train, y_train_hot)
+    return clf
+
+
 def predict(g: dgl.DGLGraph, features: torch.Tensor, train_labels: torch.Tensor, train_mask: torch.Tensor, test_mask: torch.Tensor, model: nn.Module, device: str = "cpu", info=False, proba=False):
     if info:
         print("Predicting...")
@@ -167,22 +183,13 @@ def predict(g: dgl.DGLGraph, features: torch.Tensor, train_labels: torch.Tensor,
     # predict on embeddings
     X = embeds.detach().cpu().numpy()
     X = normalize(X, norm="l2")
-    X_train = X[train_mask]
-    X_test = X[test_mask]
+    X_train = X[train_mask.detach().cpu().numpy()]
+    X_test = X[test_mask.detach().cpu().numpy()]
 
     y_train = train_labels.detach().cpu().numpy().reshape(-1, 1)
     y_train_hot = OneHotEncoder(categories="auto").fit_transform(y_train).toarray().astype(np.bool)
 
-    logreg = LogisticRegression(solver="liblinear")
-    c = 2.0 ** np.arange(-10, 10)
-    clf = GridSearchCV(
-        estimator=OneVsRestClassifier(logreg),
-        param_grid=dict(estimator__C=c),
-        n_jobs=8,
-        cv=5,
-        verbose=0,
-    )
-    clf.fit(X_train, y_train_hot)
+    clf = get_classifier(X_train, y_train_hot)
 
     if proba:
         return clf.predict_proba(X_test)
@@ -197,7 +204,6 @@ def evaluate(g: dgl.DGLGraph, features: torch.Tensor, train_labels: torch.Tensor
     # get embeddings
     g = g.add_self_loop()
     g = g.to(device)
-    model = model.to(device)
     feat = features.to(device)
     embeds = model.get_embedding(g, feat)
 
@@ -211,16 +217,7 @@ def evaluate(g: dgl.DGLGraph, features: torch.Tensor, train_labels: torch.Tensor
     y_val = val_labels.detach().cpu().numpy().reshape(-1, 1)
     y_train_hot = OneHotEncoder(categories="auto").fit_transform(y_train).toarray().astype(np.bool)
 
-    logreg = LogisticRegression(solver="liblinear")
-    c = 2.0 ** np.arange(-10, 10)
-    clf = GridSearchCV(
-        estimator=OneVsRestClassifier(logreg),
-        param_grid=dict(estimator__C=c),
-        n_jobs=8,
-        cv=5,
-        verbose=0,
-    )
-    clf.fit(X_train, y_train_hot)
+    clf = get_classifier(X_train, y_train_hot)
 
     y_val_pred = clf.predict_proba(X_val).argmax(axis=1).astype(np.int64)
     return accuracy_score(y_val, y_val_pred)
@@ -248,6 +245,23 @@ def gen_node_mask_lst(g: dgl.DGLGraph, batch_size: int, device: str = 'cpu'):
     return node_mask_lst
 
 
+def gen_subgraph_lst(g: dgl.DGLGraph, features: torch.Tensor, batch_size: int, batches: int, device: str = 'cpu'):
+    """ 
+    Generate mini batch of node masks
+    """
+    N = g.num_nodes()
+    idx = torch.randint(0, N, (batches * batch_size, ), device=device)
+    node_mask = torch.arange(0, N, device=device)[idx]
+    subgraph_lst = []
+    for i in range(0, batches * batch_size, batch_size):
+        mask = node_mask[i:i+batch_size]
+        subgraph = g.subgraph(mask)
+        sub_features = features[mask]
+        subgraph_lst.append((subgraph, sub_features))
+
+    return subgraph_lst
+
+
 def train(g: dgl.DGLGraph, features: torch.Tensor, train_labels: torch.Tensor, val_labels: torch.Tensor, train_mask: torch.Tensor, val_mask: torch.Tensor,
           model: nn.Module, optimizer, epochs: int, batch_size: int, drop_feature_rate_1, drop_edge_rate_1, drop_feature_rate_2, drop_edge_rate_2, device: str = "cpu", info=False, pbar=True):
     """
@@ -269,15 +283,13 @@ def train(g: dgl.DGLGraph, features: torch.Tensor, train_labels: torch.Tensor, v
     epochs_progress = tqdm(total=epochs, desc='Epoch', disable=not pbar)
     train_log = tqdm(total=0, position=1, bar_format='{desc}', disable=not pbar)
 
+    subgraph_lst = gen_subgraph_lst(g, features, batch_size, 5 * math.ceil(g.num_nodes() / batch_size), device=device)
     for epoch in range(epochs):
-        node_mask_lst = gen_node_mask_lst(g, batch_size, device=device)
-        for node_mask in node_mask_lst:
-            sub_graph = g.subgraph(node_mask)
-            sub_features = features[node_mask, :]
+        for subgraph, sub_features in random.choices(subgraph_lst, k=math.ceil(g.num_nodes() / batch_size)):
             model.train()
             optimizer.zero_grad()
-            graph1, features1 = aug(sub_graph, sub_features, drop_feature_rate_1, drop_edge_rate_1)
-            graph2, features2 = aug(sub_graph, sub_features, drop_feature_rate_2, drop_edge_rate_2)
+            graph1, features1 = aug(subgraph, sub_features, drop_feature_rate_1, drop_edge_rate_1)
+            graph2, features2 = aug(subgraph, sub_features, drop_feature_rate_2, drop_edge_rate_2)
 
             graph1 = graph1.to(device)
             graph2 = graph2.to(device)

@@ -129,3 +129,22 @@ class DeepGAT(nn.Module):
             h = layer(g, h)
             h = h.reshape(bs, -1)
         return h
+
+
+class CHEB(nn.Module):
+    def __init__(self, in_dim, hidden_dim, out_dim, k, dropout):
+        super(CHEB, self).__init__()
+        self.layer1 = dglnn.GraphConv(in_dim, hidden_dim)
+        self.layer2 = dglnn.SAGEConv(hidden_dim, hidden_dim, "mean")
+        self.layer3 = dglnn.ChebConv(hidden_dim, out_dim, k, activation=None)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, g, h):
+        h = self.layer1(g, h)
+        h = F.relu(h)
+        h = self.dropout(h)
+        h = self.layer2(g, h)
+        h = F.relu(h)
+        h = self.dropout(h)
+        h = self.layer3(g, h)
+        return h
