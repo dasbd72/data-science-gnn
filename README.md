@@ -2,6 +2,16 @@
 
 ## How to run
 
+### Requirements
+
+directory `./ouptuts` should exists
+
+```bash=
+mkdir -p outputs
+```
+
+dataset should be in `./dataset`
+
 ### Parameters
 
 * --use_gpu
@@ -13,28 +23,27 @@
 * --epochs
   * Training iterations
 * --node2vec
-  * adds new features
+  * adds random walk features
 * --model
   * Supports
     * GCN
     * SAGE
-    * GAT
-    * DotGAT
     * Grace
     * SSP
-  * Best is Grace
+  * Best model is Grace
 
 ### Examples
 
-To tune variables
+To tune variables (also generates ./outputs/output_\[val_acc\].csv)
 
 ```bash=
-python3 train.py --use_gpu --tuning --es_iter 50 --epochs 500 --model "Grace"
+python3 train.py --use_gpu --node2vec --tuning --epochs 1500 --model "Grace"
 ```
 
-To train and validate
+To train, validate then predict
 
 ```bash=
-python3 train.py --use_gpu --es_iter 50 --epochs 500 --model "Grace"
+python3 train.py --use_gpu --node2vec --epochs 1500 --model "Grace"
 ```
 
+At last, vote on output files in voting.ipynb
