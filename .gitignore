@@ -3,4 +3,4 @@ __pycache__
 
 dataset
 archive
-outputs/*.csv
+outputs
