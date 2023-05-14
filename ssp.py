@@ -82,27 +82,32 @@ class KFAC(Optimizer):
         self._bwd_handles = []
         self._iteration_counter = 0
 
-        for mod in net.modules():
+        for mod in net.children():
             mod_name = mod.__class__.__name__
-            print(mod_name)
-            if mod_name in ['CRD', 'CLS']:
-                handle = mod.register_forward_pre_hook(self._save_input)
-                self._fwd_handles.append(handle)
+            if mod_name not in ['CRD', 'CLS']:
+                continue
 
-                for sub_mod in mod.modules():
-                    i_sub_mod = 0
-                    if hasattr(sub_mod, 'weight'):
-                        assert i_sub_mod == 0
-                        handle = sub_mod.register_backward_hook(self._save_grad_output)
-                        self._bwd_handles.append(handle)
+            handle = mod.register_forward_pre_hook(self._save_input)
+            self._fwd_handles.append(handle)
 
-                        params = [sub_mod.weight]
-                        if sub_mod.bias is not None:
-                            params.append(sub_mod.bias)
+            for sub_mod in mod.children():
+                sub_mod_name = sub_mod.__class__.__name__
+                if sub_mod_name not in ['GCNConv']:
+                    continue
 
-                        d = {'params': params, 'mod': mod, 'sub_mod': sub_mod}
-                        self.params.append(d)
-                        i_sub_mod += 1
+                handle = sub_mod.register_backward_hook(self._save_grad_output)
+                self._bwd_handles.append(handle)
+
+                params = []
+                for sub_sub_mod in sub_mod.children():
+                    sub_sub_mod_name = sub_sub_mod.__class__.__name__
+                    if sub_sub_mod_name not in ['Linear']:
+                        continue
+                    params = [sub_sub_mod.weight]
+                if sub_mod.bias is not None:
+                    params.append(sub_mod.bias)
+                d = {'params': params, 'mod': mod, 'sub_mod': sub_mod, 'sub_sub_mod': sub_sub_mod}
+                self.params.append(d)
 
         super(KFAC, self).__init__(self.params, {})
 
@@ -179,7 +184,7 @@ class KFAC(Optimizer):
         """Applies preconditioning."""
         ixxt = state['ixxt']  # [d_in x d_in]
         iggt = state['iggt']  # [d_out x d_out]
-        g = weight.grad.data  # [d_in x d_out]
+        g = weight.grad.data.T  # [d_in x d_out]
         s = g.shape
 
         g = g.contiguous().view(-1, g.shape[-1])
@@ -195,11 +200,12 @@ class KFAC(Optimizer):
         else:
             gb = None
         g = g.contiguous().view(*s)
-        return g, gb
+        return g.T, gb
 
     def _compute_covs(self, group, state):
         """Computes the covariances."""
         sub_mod = group['sub_mod']
+        sub_sub_mod = group['sub_sub_mod']
         x = self.state[group['mod']]['x']  # [n x d_in]
         gy = self.state[group['sub_mod']]['gy']  # [n x d_out]
         edge_index, edge_weight = self._cached_edge_index  # [2, n_edges], [n_edges]
@@ -210,8 +216,8 @@ class KFAC(Optimizer):
 
         x = x.data.t()
 
-        if sub_mod.weight.ndim == 3:
-            x = x.repeat(sub_mod.weight.shape[0], 1)
+        if sub_sub_mod.weight.ndim == 3:
+            x = x.repeat(sub_sub_mod.weight.shape[0], 1)
 
         if sub_mod.bias is not None:
             ones = torch.ones_like(x[:1])
@@ -314,9 +320,11 @@ def train(edge_index: torch.Tensor, features: torch.Tensor, train_labels: torch.
     edge_index = edge_index.to(device)
     features = features.to(device)
     train_labels = train_labels.to(device)
-    val_labels = val_labels.to(device)
+    if val_labels is not None:
+        val_labels = val_labels.to(device)
     train_mask = train_mask.to(device)
-    val_mask = val_mask.to(device)
+    if val_labels is not None:
+        val_mask = val_mask.to(device)
     model = model.to(device)
 
     # training loop
@@ -341,28 +349,23 @@ def train(edge_index: torch.Tensor, features: torch.Tensor, train_labels: torch.
         optimizer.step()
 
         acc = evaluate(edge_index, features, val_labels, val_mask, model, device=device)
-        train_log.set_description_str(
-            "Current Epoch: {:05d} | Loss {:.4f} | Accuracy {:.4f} ".format(
-                epoch, loss.item(), acc
-            )
-        )
+        train_log.set_description_str("Current Epoch: {:05d} | Loss {:.4f} | Accuracy {:.4f} ".format(epoch, loss.item(), acc))
+        epochs_progress.update()
 
-        with torch.no_grad():
-            label[val_mask] = val_labels
-            val_loss = (F.nll_loss(out[val_mask], label[val_mask]) + lam * F.nll_loss(out[~val_mask], label[~val_mask])).item()
         if es_iters:
+            with torch.no_grad():
+                label[val_mask] = val_labels
+                val_loss = (F.nll_loss(out[val_mask], label[val_mask]) + lam * F.nll_loss(out[~val_mask], label[~val_mask])).item()
             if val_loss < loss_min:
                 loss_min = val_loss
                 es_i = 0
             else:
                 es_i += 1
-
             if es_i >= es_iters:
                 epochs_progress.close()
                 train_log.close()
                 print(f"Early stopping at epoch={epoch+1}")
                 break
 
-        epochs_progress.update()
     epochs_progress.close()
     train_log.close()

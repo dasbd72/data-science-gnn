@@ -45,6 +45,34 @@ class GCN(nn.Module):
 #         pass
 
 
+class GCNII(nn.Module):
+    def __init__(self, in_size, hid_size, out_size, num_layers, dropout, lambda_, alpha, variant=False):
+        super().__init__()
+        self.convs = nn.ModuleList()
+        for i in range(1, num_layers+1):
+            self.convs.append(dglnn.GCN2Conv(hid_size, i, alpha, lambda_))
+        self.fcs = nn.ModuleList()
+        self.fcs.append(nn.Linear(in_size, hid_size))
+        self.fcs.append(nn.Linear(hid_size, out_size))
+        self.act_fn = nn.ReLU()
+        self.dropout = dropout
+        self.alpha = alpha
+        self.lambda_ = lambda_
+
+    def forward(self, g, features):
+        h = features
+        h = F.dropout(features, self.dropout, training=self.training)
+        _layers = []
+        layer_inner = self.act_fn(self.fcs[0](h))
+        _layers.append(layer_inner)
+        for i, conv in enumerate(self.convs):
+            layer_inner = F.dropout(layer_inner, self.dropout, training=self.training)
+            layer_inner = self.act_fn(conv(g, layer_inner, _layers[0]))
+        layer_inner = F.dropout(layer_inner, self.dropout, training=self.training)
+        layer_inner = self.fcs[-1](layer_inner)
+        return F.log_softmax(layer_inner, dim=1)
+
+
 class SAGE(nn.Module):
     def __init__(self, in_size, hid_size, out_size, dropout=0.5):
         super().__init__()

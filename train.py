@@ -124,6 +124,7 @@ def train(g: dgl.DGLGraph, features: torch.Tensor, train_labels: torch.Tensor,
 
 
 def write_output(indices, filename='outputs/output.csv'):
+    print(f"Export predictions to {filename}.")
     # Export predictions as csv file
     with open(filename, 'w') as f:
         f.write('Id,Predict\n')
@@ -144,7 +145,14 @@ def process_labels(labels: torch.Tensor, masks: torch.Tensor):
     return ret
 
 
-def main():
+def features_standardize(features):
+    m = features.mean(0, keepdim=True)
+    s = features.std(0, unbiased=False, keepdim=True)
+    features_std = (features - m) / s
+    return features_std
+
+
+if __name__ == '__main__':
     parser = ArgumentParser()
     # you can add your arguments if needed
     parser.add_argument('--epochs', type=int, default=300)
@@ -152,7 +160,6 @@ def main():
     parser.add_argument('--use_gpu', action='store_true')
     parser.add_argument('--model', type=str, default='GCN')
     parser.add_argument('--tuning', action='store_true')
-    parser.add_argument('--train_all', action='store_true')
     parser.add_argument('--ensembles', type=int, default=1)
     parser.add_argument('--node2vec', action='store_true')
     args = parser.parse_args()
@@ -161,7 +168,6 @@ def main():
     n_ensembles = args.ensembles
     use_gpu = args.use_gpu
     model_str = args.model
-    train_all = args.train_all
     node2vec = args.node2vec
     tuning = args.tuning
     epochs = args.epochs
@@ -176,17 +182,27 @@ def main():
         train_labels, val_labels, test_labels, \
         train_mask, val_mask, test_mask = load_data()
 
-    if train_all:
-        labels = (process_labels(train_labels, train_mask) + process_labels(val_labels, val_mask))
-        mask = train_mask | val_mask
-        train_mask = mask
-        train_labels = labels[train_mask]
-        val_labels = None
-        val_mask = None
+    # # TODO
+    # train_all = False
+    # if train_all:
+    #     labels = (process_labels(train_labels, train_mask) + process_labels(val_labels, val_mask))
+    #     mask = train_mask | val_mask
+    #     train_mask = mask
+    #     train_labels = labels[train_mask]
+    #     val_labels = None
+    #     val_mask = None
+
+    # # TODO
+    # pubmed = True
+    # if pubmed:
+    #     _dataset = dgl.data.PubmedGraphDataset()
+    #     val_labels = _dataset[0].ndata['label'][test_mask]
+    #     val_mask = test_mask
 
     # === Get dimensions ===
     in_size = features.shape[1]
     out_size = num_classes
+    _features = features
 
     # === Initialize the model (Baseline Model: GCN) ===
     model: nn.Module = None
@@ -196,11 +212,24 @@ def main():
 
         if tuning:
             def objective(trial):
-                # 0.786: {'hid_size': 225, 'dropout': 0.4998782070694462, 'lr': 0.15539955776920314, 'weight_decay': 0.0005277555782436347}
                 hid_size = trial.suggest_int('hid_size', 1, 512)
                 dropout = trial.suggest_float('dropout', 0.1, 0.6)
                 lr = trial.suggest_float('lr', 0, 1)
                 weight_decay = trial.suggest_float('weight_decay', 0, 1e-3)
+
+                if node2vec:
+                    walk_length = trial.suggest_int('walk_length', 0, 1000)
+                    walk_p = trial.suggest_float('walk_p', 0, 1)
+                    walk_q = trial.suggest_float('walk_q', 0, 1)
+
+                    features = _features
+                    walk_features = dgl.sampling.node2vec_random_walk(graph, graph.nodes(), walk_p, walk_q, walk_length=walk_length).type(torch.float32)  # (19717, walk_length+1)
+                    features = torch.hstack((features, walk_features))
+                    features = features_standardize(features)
+                    in_size = features.shape[1]
+                else:
+                    features = _features
+                    in_size = features.shape[1]
 
                 model = GCN(in_size, hid_size, out_size, dropout).to(device)
                 loss_fcn = nn.CrossEntropyLoss()
@@ -214,9 +243,104 @@ def main():
             print('Best score:', study.best_value)
             print('Best trial parameters:', study.best_trial.params)
         else:
-            model = GCN(in_size, 225, out_size, 0.4998782070694462).to(device)
+            # 0.786: {'hid_size': 225, 'dropout': 0.4998782070694462, 'lr': 0.15539955776920314, 'weight_decay': 0.0005277555782436347}
+            params = {'hid_size': 225, 'dropout': 0.4998782070694462, 'lr': 0.15539955776920314, 'weight_decay': 0.0005277555782436347}
+            hid_size = params['hid_size']
+            dropout = params['dropout']
+            lr = params['lr']
+            weight_decay = params['weight_decay']
+
+            if node2vec:
+                walk_length = params['walk_length']
+                walk_p = params['walk_p']
+                walk_q = params['walk_q']
+
+                features = _features
+                walk_features = dgl.sampling.node2vec_random_walk(graph, graph.nodes(), walk_p, walk_q, walk_length=walk_length).type(torch.float32)  # (19717, walk_length+1)
+                features = torch.hstack((features, walk_features))
+                features = features_standardize(features)
+                in_size = features.shape[1]
+            else:
+                features = _features
+                in_size = features.shape[1]
+
+            model = GCN(in_size, hid_size, out_size, dropout).to(device)
             loss_fcn = nn.CrossEntropyLoss()
-            optimizer = torch.optim.Adam(model.parameters(), lr=0.15539955776920314, weight_decay=0.0005277555782436347)
+            optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+            train(graph, features, train_labels, val_labels, train_mask, val_mask,
+                  model, loss_fcn, optimizer, epochs, es_iters=es_iters, device=device, info=True)
+            indices = predict(graph, features, test_mask, model, device=device, info=True)
+
+    if model_str == "GCNII":
+        from model import GCNII
+
+        if tuning:
+            def objective(trial):
+                # hid_size = trial.suggest_int('hid_size', 1, 512)
+                hid_size = 64
+                # dropout = trial.suggest_float('dropout', 0.1, 0.6)
+                dropout = 0.5
+                # num_layers = trial.suggest_int('num_layers', 1, 20)
+                num_layers = 8
+                # lambda_ = trial.suggest_float('lambda_', 0, 1)
+                lambda_ = 0.5
+                # alpha = trial.suggest_float('alpha', 0, 1)
+                alpha = 0.5
+                # lr = trial.suggest_float('lr', 0, 1)
+                lr = 0.1
+                # weight_decay = trial.suggest_float('weight_decay', 0, 1e-3)
+                weight_decay = 5e-6
+
+                if node2vec:
+                    walk_length = trial.suggest_int('walk_length', 0, 1000)
+                    walk_p = trial.suggest_float('walk_p', 0, 1)
+                    walk_q = trial.suggest_float('walk_q', 0, 1)
+
+                    features = _features
+                    walk_features = dgl.sampling.node2vec_random_walk(graph, graph.nodes(), walk_p, walk_q, walk_length=walk_length).type(torch.float32)  # (19717, walk_length+1)
+                    features = torch.hstack((features, walk_features))
+                    features = features_standardize(features)
+                    in_size = features.shape[1]
+                else:
+                    features = _features
+                    in_size = features.shape[1]
+
+                model = GCNII(in_size, hid_size, out_size, num_layers, dropout, lambda_, alpha).to(device)
+                loss_fcn = nn.CrossEntropyLoss()
+                optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+                train(graph, features, train_labels, val_labels, train_mask, val_mask,
+                      model, loss_fcn, optimizer, epochs, es_iters=es_iters, device=device)
+                return evaluate(graph, features, val_labels, val_mask, model, device)
+
+            study = optuna.create_study(direction='maximize')
+            study.optimize(objective, n_trials=100)
+            print('Best score:', study.best_value)
+            print('Best trial parameters:', study.best_trial.params)
+        else:
+            # 0.786: {'hid_size': 225, 'dropout': 0.4998782070694462, 'lr': 0.15539955776920314, 'weight_decay': 0.0005277555782436347}
+            params = {'hid_size': 225, 'dropout': 0.4998782070694462, 'lr': 0.15539955776920314, 'weight_decay': 0.0005277555782436347}
+            hid_size = params['hid_size']
+            dropout = params['dropout']
+            lr = params['lr']
+            weight_decay = params['weight_decay']
+
+            if node2vec:
+                walk_length = params['walk_length']
+                walk_p = params['walk_p']
+                walk_q = params['walk_q']
+
+                features = _features
+                walk_features = dgl.sampling.node2vec_random_walk(graph, graph.nodes(), walk_p, walk_q, walk_length=walk_length).type(torch.float32)  # (19717, walk_length+1)
+                features = torch.hstack((features, walk_features))
+                features = features_standardize(features)
+                in_size = features.shape[1]
+            else:
+                features = _features
+                in_size = features.shape[1]
+
+            model = GCNII(in_size, hid_size, out_size, dropout).to(device)
+            loss_fcn = nn.CrossEntropyLoss()
+            optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
             train(graph, features, train_labels, val_labels, train_mask, val_mask,
                   model, loss_fcn, optimizer, epochs, es_iters=es_iters, device=device, info=True)
             indices = predict(graph, features, test_mask, model, device=device, info=True)
@@ -231,6 +355,20 @@ def main():
                 lr = trial.suggest_float('lr', 0, 1)
                 weight_decay = trial.suggest_float('weight_decay', 0, 1e-3)
 
+                if node2vec:
+                    walk_length = trial.suggest_int('walk_length', 0, 1000)
+                    walk_p = trial.suggest_float('walk_p', 0, 1)
+                    walk_q = trial.suggest_float('walk_q', 0, 1)
+
+                    features = _features
+                    walk_features = dgl.sampling.node2vec_random_walk(graph, graph.nodes(), walk_p, walk_q, walk_length=walk_length).type(torch.float32)  # (19717, walk_length+1)
+                    features = torch.hstack((features, walk_features))
+                    features = features_standardize(features)
+                    in_size = features.shape[1]
+                else:
+                    features = _features
+                    in_size = features.shape[1]
+
                 model = SAGE(in_size, hid_size, out_size, dropout).to(device)
                 loss_fcn = nn.CrossEntropyLoss()
                 optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -244,107 +382,29 @@ def main():
             print('Best trial parameters:', study.best_trial.params)
         else:
             # 0.804: {'hid_size': 204, 'dropout': 0.22420182392055, 'lr': 0.005031767855753401, 'weight_decay': 8.544936816998818e-05}
-            model = SAGE(in_size, 204, out_size, 0.22420182392055).to(device)
-            loss_fcn = nn.CrossEntropyLoss()
-            optimizer = torch.optim.Adam(model.parameters(), lr=0.005031767855753401, weight_decay=8.544936816998818e-05)
-            train(graph, features, train_labels, val_labels, train_mask, val_mask,
-                  model, loss_fcn, optimizer, epochs, es_iters=es_iters, device=device, info=True)
-            indices = predict(graph, features, test_mask, model, device=device, info=True)
+            params = {'hid_size': 204, 'dropout': 0.22420182392055, 'lr': 0.005031767855753401, 'weight_decay': 8.544936816998818e-05}
+            hid_size = params['hid_size']
+            dropout = params['dropout']
+            lr = params['lr']
+            weight_decay = params['weight_decay']
 
-    elif model_str == "CHEB":
-        from model import CHEB
+            if node2vec:
+                walk_length = params['walk_length']
+                walk_p = params['walk_p']
+                walk_q = params['walk_q']
 
-        if tuning:
-            def objective(trial):
-                hid_size = trial.suggest_int('hid_size', 1, 512)
-                k = trial.suggest_int('k', 1, 10)
-                dropout = trial.suggest_float('dropout', 0.1, 0.9)
-                lr = trial.suggest_float('lr', 0, 1e-2)
-                weight_decay = trial.suggest_float('weight_decay', 0, 1e-3)
+                features = _features
+                walk_features = dgl.sampling.node2vec_random_walk(graph, graph.nodes(), walk_p, walk_q, walk_length=walk_length).type(torch.float32)  # (19717, walk_length+1)
+                features = torch.hstack((features, walk_features))
+                features = features_standardize(features)
+                in_size = features.shape[1]
+            else:
+                features = _features
+                in_size = features.shape[1]
 
-                model = CHEB(in_size, hid_size, out_size, k, dropout).to(device)
-                loss_fcn = nn.CrossEntropyLoss()
-                optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-                train(graph, features, train_labels, val_labels, train_mask, val_mask,
-                      model, loss_fcn, optimizer, epochs, es_iters=es_iters, device=device)
-                return evaluate(graph, features, val_labels, val_mask, model, device=device)
-
-            study = optuna.create_study(direction='maximize')
-            study.optimize(objective, n_trials=100)
-            print('Best score:', study.best_value)
-            print('Best trial parameters:', study.best_trial.params)
-        else:
-            hid_size = 64
-            k = 8
-            dropout = 0.5
-            lr = 5e-3
-            weight_decay = 5e-5
-
-            model = CHEB(in_size, hid_size, out_size, k, dropout).to(device)
+            model = SAGE(in_size, hid_size, out_size, dropout).to(device)
             loss_fcn = nn.CrossEntropyLoss()
             optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-            train(graph, features, train_labels, val_labels, train_mask, val_mask,
-                  model, loss_fcn, optimizer, epochs, es_iters=es_iters, device=device, info=True)
-            indices = predict(graph, features, test_mask, model, device=device, info=True)
-
-    elif model_str == "GAT":
-        from model import GAT
-        # 0.802: {'hid_size': 15, 'num_heads': 78, 'dropout': 0.35504093201574133, 'lr': 0.0001596696063196532, 'weight_decay': 0.0007732094500682307}
-
-        if tuning:
-            def objective(trial):
-                hid_size = trial.suggest_int('hid_size', 1, 64)
-                num_heads = trial.suggest_int('num_heads', 1, 128)
-                feat_drop = trial.suggest_float('feat_drop', 0.1, 0.6)
-                attn_drop = trial.suggest_float('attn_drop', 0.1, 0.6)
-                lr = trial.suggest_float('lr', 0, 1e-3)
-                weight_decay = trial.suggest_float('weight_decay', 0, 1e-3)
-
-                model = GAT(in_size, hid_size, out_size, num_heads, feat_drop=feat_drop, attn_drop=attn_drop).to(device)
-                loss_fcn = nn.CrossEntropyLoss()
-                optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-                train(graph, features, train_labels, val_labels, train_mask, val_mask,
-                      model, loss_fcn, optimizer, epochs, es_iters=es_iters, device=device)
-                return evaluate(graph, features, val_labels, val_mask, model, device=device)
-
-            study = optuna.create_study(direction='maximize')
-            study.optimize(objective, n_trials=100)
-            print('Best score:', study.best_value)
-            print('Best trial parameters:', study.best_trial.params)
-        else:
-            model = GAT(in_size, 15, out_size, 78, 0.35504093201574133).to(device)
-            loss_fcn = nn.CrossEntropyLoss()
-            optimizer = torch.optim.Adam(model.parameters(), lr=0.0001596696063196532, weight_decay=0.0007732094500682307)
-            train(graph, features, train_labels, val_labels, train_mask, val_mask,
-                  model, loss_fcn, optimizer, epochs, es_iters=es_iters, device=device, info=True)
-            indices = predict(graph, features, test_mask, model, device=device, info=True)
-
-    elif model_str == "DotGAT":
-        from model import DotGAT
-
-        if tuning:
-            def objective(trial):
-                hid_size = trial.suggest_int('hid_size', 1, 64)
-                num_heads = trial.suggest_int('num_heads', 1, 128)
-                dropout = trial.suggest_float('dropout', 0.1, 0.6)
-                lr = trial.suggest_float('lr', 0, 1e-3)
-                weight_decay = trial.suggest_float('weight_decay', 0, 1e-3)
-
-                model = DotGAT(in_size, hid_size, out_size, num_heads, dropout).to(device)
-                loss_fcn = nn.CrossEntropyLoss()
-                optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-                train(graph, features, train_labels, val_labels, train_mask, val_mask,
-                      model, loss_fcn, optimizer, epochs, es_iters=es_iters, device=device)
-                return evaluate(graph, features, val_labels, val_mask, model, device=device)
-
-            study = optuna.create_study(direction='maximize')
-            study.optimize(objective, n_trials=100)
-            print('Best score:', study.best_value)
-            print('Best trial parameters:', study.best_trial.params)
-        else:
-            model = DotGAT(in_size, 15, out_size, 78, 0.35504093201574133).to(device)
-            loss_fcn = nn.CrossEntropyLoss()
-            optimizer = torch.optim.Adam(model.parameters(), lr=0.0001596696063196532, weight_decay=0.0007732094500682307)
             train(graph, features, train_labels, val_labels, train_mask, val_mask,
                   model, loss_fcn, optimizer, epochs, es_iters=es_iters, device=device, info=True)
             indices = predict(graph, features, test_mask, model, device=device, info=True)
@@ -353,16 +413,6 @@ def main():
         import grace
         from grace import Grace
 
-        # if node2vec:
-        #     walk_length = 500
-        #     walk_features: torch.Tensor = dgl.sampling.node2vec_random_walk(graph, graph.nodes(), 0.25, 0.25, walk_length=walk_length)  # (19717, walk_length+1)
-        #     features = torch.hstack((features, walk_features))  # (19717, 500+walk_length+1)
-        #     m = features.mean(0, keepdim=True)
-        #     s = features.std(0, unbiased=False, keepdim=True)
-        #     features = (features - m) / s
-        #     in_size = features.shape[1]
-
-        _features = features
         if tuning:
             def objective(trial):
                 hid_size = trial.suggest_int('hid_size', 1, 512)
@@ -382,14 +432,14 @@ def main():
                     walk_p = trial.suggest_float('walk_p', 0, 1)
                     walk_q = trial.suggest_float('walk_q', 0, 1)
 
-                    walk_features: torch.Tensor = dgl.sampling.node2vec_random_walk(graph, graph.nodes(), walk_p, walk_q, walk_length=walk_length)  # (19717, walk_length+1)
-                    # features = torch.hstack((_features, walk_features))  # (19717, 500+walk_length+1)
-                    # m = features.mean(0, keepdim=True)
-                    # s = features.std(0, unbiased=False, keepdim=True)
-                    # features = (features - m) / s
-                    # in_size = features.shape[1]
+                    features = _features
+                    walk_features = dgl.sampling.node2vec_random_walk(graph, graph.nodes(), walk_p, walk_q, walk_length=walk_length).type(torch.float32)  # (19717, walk_length+1)
+                    features = torch.hstack((features, walk_features))
+                    features = features_standardize(features)
+                    in_size = features.shape[1]
                 else:
-                    walk_features = None
+                    features = _features
+                    in_size = features.shape[1]
 
                 batch_size = math.ceil(graph.num_nodes() * 0.5)
                 # batch_size = graph.num_nodes()
@@ -406,7 +456,6 @@ def main():
                 write_output(indices, filename=f'outputs/output.{int(1000*acc)}.csv')
                 return acc
 
-            optuna.logging.get_logger("optuna").addHandler(logging.StreamHandler(sys.stdout))
             study_name = "optuna-grace"
             storage_name = "sqlite:///{}.db".format(study_name)
             study = optuna.create_study(direction='maximize', study_name=study_name, storage=storage_name, load_if_exists=True)
@@ -417,44 +466,43 @@ def main():
             # 0.854: {'hid_size': 266, 'out_size': 375, 'num_layers': 2, 'act_fn_str': 'prelu', 'drop_edge_rate_1': 0.10661225285451398, 'drop_edge_rate_2': 0.3833879662681614, 'drop_feature_rate_1': 0.4508433772266215, 'drop_feature_rate_2': 0.4303120406763847, 'temp': 0.47456804523077506, 'lr': 0.0009660679922312985, 'weight_decay': 0.0009953991461427538}
 
             # with node2vec
-            # 0.84: {'act_fn_str': 'prelu', 'drop_edge_rate_1': 0.24362765977905837, 'drop_edge_rate_2': 0.6342788109844308, 'drop_feature_rate_1': 0.5361947735169645, 'drop_feature_rate_2': 0.4074135977825209, 'hid_size': 422, 'lr': 0.0006801087289555603, 'num_layers': 3, 'out_size': 474, 'temp': 0.40170123987706596, 'weight_decay': 0.0008015346838736527}
-            # 0.848: {'act_fn_str': 'relu', 'drop_edge_rate_1': 0.3179447606672301, 'drop_edge_rate_2': 0.8426984175787502, 'drop_feature_rate_1': 0.5335787455853964, 'drop_feature_rate_2': 0.3826710505908456, 'hid_size': 230, 'lr': 0.00032165718913340933, 'num_layers': 10, 'out_size': 511, 'temp': 0.35364542318132747, 'walk_length': 433, 'walk_p': 0.8788506606911656, 'walk_q': 0.7999299625540663, 'weight_decay': 6.581158747208596e-05}
-            # 0.856: {'act_fn_str': 'relu', 'drop_edge_rate_1': 0.5251482599492395, 'drop_edge_rate_2': 0.37782962566511036, 'drop_feature_rate_1': 0.5292745614691008, 'drop_feature_rate_2': 0.3579714315545969, 'hid_size': 355, 'lr': 0.000686604412691569, 'num_layers': 5, 'out_size': 291, 'temp': 0.5388011027084435, 'walk_length': 182, 'walk_p': 0.12214064945424387, 'walk_q': 0.3603707118954555, 'weight_decay': 0.00024982201371369795}
+            # 0.834: {'hid_size': 506, 'out_size': 190, 'num_layers': 8, 'act_fn_str': 'relu', 'drop_edge_rate_1': 0.21223277464851337, 'drop_edge_rate_2': 0.6424141225292261, 'drop_feature_rate_1': 0.2720684410251818, 'drop_feature_rate_2': 0.5498122852125431, 'temp': 0.28089871726866567, 'lr': 0.0004800855348433543, 'weight_decay': 0.00036167043026865016, 'walk_length': 43, 'walk_p': 0.9573610957634249, 'walk_q': 0.01953251326085559}
+            # 0.834: {'hid_size': 352, 'out_size': 147, 'num_layers': 8, 'act_fn_str': 'relu', 'drop_edge_rate_1': 0.14075583164139704, 'drop_edge_rate_2': 0.5746992754201669, 'drop_feature_rate_1': 0.2446741928656893, 'drop_feature_rate_2': 0.4594874443124306, 'temp': 0.27202500316338163, 'lr': 0.00047978437712733535, 'weight_decay': 0.0004421260262163701, 'walk_length': 59, 'walk_p': 0.7569845488227431, 'walk_q': 0.005770545679393149}
+            # 0.841: {'act_fn_str': 'relu', 'drop_edge_rate_1': 0.4557229473572051, 'drop_edge_rate_2': 0.6621814364041027, 'drop_feature_rate_1': 0.45597986006744484, 'drop_feature_rate_2': 0.15278738671222483, 'hid_size': 116, 'lr': 0.0009023515728948979, 'num_layers': 6, 'out_size': 244, 'temp': 0.3194226847966415, 'walk_length': 287, 'walk_p': 0.42298370202749275, 'walk_q': 0.506942629940019, 'weight_decay': 0.0007246960055252379}
 
-            param = {'act_fn_str': 'relu', 'drop_edge_rate_1': 0.3179447606672301, 'drop_edge_rate_2': 0.8426984175787502, 'drop_feature_rate_1': 0.5335787455853964, 'drop_feature_rate_2': 0.3826710505908456, 'hid_size': 230, 'lr': 0.00032165718913340933, 'num_layers': 10, 'out_size': 511, 'temp': 0.35364542318132747, 'walk_length': 433, 'walk_p': 0.8788506606911656, 'walk_q': 0.7999299625540663, 'weight_decay': 6.581158747208596e-05}
+            params = {'act_fn_str': 'relu', 'drop_edge_rate_1': 0.4557229473572051, 'drop_edge_rate_2': 0.6621814364041027, 'drop_feature_rate_1': 0.45597986006744484, 'drop_feature_rate_2': 0.15278738671222483, 'hid_size': 116, 'lr': 0.0009023515728948979, 'num_layers': 6, 'out_size': 244, 'temp': 0.3194226847966415, 'walk_length': 287, 'walk_p': 0.42298370202749275, 'walk_q': 0.506942629940019, 'weight_decay': 0.0007246960055252379}
 
-            hid_size = param['hid_size']
-            out_size = param['out_size']
-            num_layers = param['num_layers']
-            act_fn_str = param['act_fn_str']
-            drop_edge_rate_1 = param['drop_edge_rate_1']
-            drop_edge_rate_2 = param['drop_edge_rate_2']
-            drop_feature_rate_1 = param['drop_feature_rate_1']
-            drop_feature_rate_2 = param['drop_feature_rate_2']
-            temp = param['temp']
-            lr = param['lr']
-            weight_decay = param['weight_decay']
+            hid_size = params['hid_size']
+            out_size = params['out_size']
+            num_layers = params['num_layers']
+            act_fn_str = params['act_fn_str']
+            drop_edge_rate_1 = params['drop_edge_rate_1']
+            drop_edge_rate_2 = params['drop_edge_rate_2']
+            drop_feature_rate_1 = params['drop_feature_rate_1']
+            drop_feature_rate_2 = params['drop_feature_rate_2']
+            temp = params['temp']
+            lr = params['lr']
+            weight_decay = params['weight_decay']
 
             if node2vec:
-                walk_length = param['walk_length']
-                walk_p = param['walk_p']
-                walk_q = param['walk_q']
+                walk_length = params['walk_length']
+                walk_p = params['walk_p']
+                walk_q = params['walk_q']
 
-                walk_features: torch.Tensor = dgl.sampling.node2vec_random_walk(graph, graph.nodes(), walk_p, walk_q, walk_length=walk_length)  # (19717, walk_length+1)
-                print(walk_features)
-                # features = torch.hstack((_features, walk_features))  # (19717, 500+walk_length+1)
-                # m = features.mean(0, keepdim=True)
-                # s = features.std(0, unbiased=False, keepdim=True)
-                # features = (features - m) / s
-                # in_size = features.shape[1]
+                features = _features
+                walk_features = dgl.sampling.node2vec_random_walk(graph, graph.nodes(), walk_p, walk_q, walk_length=walk_length).type(torch.float32)  # (19717, walk_length+1)
+                features = torch.hstack((features, walk_features))
+                features = features_standardize(features)
+                in_size = features.shape[1]
             else:
-                walk_features = None
+                features = _features
+                in_size = features.shape[1]
 
             batch_size = math.ceil(graph.num_nodes() * 0.5)
             # batch_size = graph.num_nodes()
+            act_fn = ({"relu": nn.ReLU(), "prelu": nn.PReLU()})[act_fn_str]
 
             if n_ensembles == 1:
-                act_fn = ({"relu": nn.ReLU(), "prelu": nn.PReLU()})[act_fn_str]
                 model = Grace(in_size, hid_size, out_size, num_layers, act_fn, temp).to(device)
                 optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
@@ -468,13 +516,12 @@ def main():
                 test_probas = np.zeros((test_labels.shape[0], num_classes))
 
                 for _ in range(n_ensembles):
-                    act_fn = ({"relu": nn.ReLU(), "prelu": nn.PReLU()})[act_fn_str]
                     model = Grace(in_size, hid_size, out_size, num_layers, act_fn, temp).to(device)
                     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
                     grace.train(graph, features, train_labels, val_labels, train_mask, val_mask,
                                 model, optimizer, epochs, batch_size,
-                                drop_feature_rate_1, drop_feature_rate_2, drop_edge_rate_1, drop_edge_rate_2, device=device, pbar=False)
+                                drop_feature_rate_1, drop_feature_rate_2, drop_edge_rate_1, drop_edge_rate_2, device=device, pbar=True)
                     if val_labels is not None:
                         val_probas += grace.predict(graph, features, train_labels, train_mask, val_mask, model, device=device, proba=True)
                     test_probas += grace.predict(graph, features, train_labels, train_mask, test_mask, model, device=device, proba=True)
@@ -486,7 +533,6 @@ def main():
 
     elif model_str == "SSP":
         import ssp
-        from ssp import Net
 
         edge_index = torch.vstack(graph.edges())
 
@@ -494,20 +540,33 @@ def main():
             def objective(trial: optuna.Trial):
                 hid_size = trial.suggest_int('hid_size', 1, 512)
                 dropout = trial.suggest_float('dropout', 0.1, 0.9)
-                eps = trial.suggest_float('eps', 0, 1e-1)
+                eps = trial.suggest_float('eps', 1e-1, 1)
                 update_freq = trial.suggest_int('update_freq', 1, 64)
                 alpha = None
-                gamma = trial.suggest_int('gamma', 1, 64)
+                gamma = trial.suggest_int('gamma', 1, 10)
                 lr = trial.suggest_float('lr', 0, 1e-2)
-                weight_decay = trial.suggest_float('weight_decay', 0, 1e-3)
-                # momentum = trial.suggest_float('momentum', 0, 1)
-                momentum = 0.9
-                # precond_str = trial.suggest_categorical('precond_str', ['kfac', None])
-                precond_str = None
-                # optim_str = trial.suggest_categorical('optim_str', ['sgd', 'adam'])
-                optim_str = 'adam'
+                precond_str = trial.suggest_categorical('precond_str', ['kfac', None])
+                optim_str = trial.suggest_categorical('optim_str', ['sgd', 'adam'])
+                if optim_str == 'adam':
+                    weight_decay = trial.suggest_float('weight_decay', 0, 1e-3)
+                else:
+                    momentum = trial.suggest_float('momentum', 0, 1)
 
-                model = Net(in_size, hid_size, out_size, dropout)
+                if node2vec:
+                    walk_length = trial.suggest_int('walk_length', 0, 1000)
+                    walk_p = trial.suggest_float('walk_p', 0, 1)
+                    walk_q = trial.suggest_float('walk_q', 0, 1)
+
+                    features = _features
+                    walk_features = dgl.sampling.node2vec_random_walk(graph, graph.nodes(), walk_p, walk_q, walk_length=walk_length).type(torch.float32)  # (19717, walk_length+1)
+                    features = torch.hstack((features, walk_features))
+                    features = features_standardize(features)
+                    in_size = features.shape[1]
+                else:
+                    features = _features
+                    in_size = features.shape[1]
+
+                model = ssp.Net(in_size, hid_size, out_size, dropout)
                 model.to(device).reset_parameters()
 
                 preconditioner = ssp.KFAC(
@@ -519,14 +578,15 @@ def main():
                     alpha=alpha if alpha is not None else 1.,
                     constraint_norm=False
                 ) if precond_str == 'kfac' else None
-                optimizer = {'adam': torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay),
-                             'sgd': torch.optim.SGD(model.parameters(), lr=lr, momentum=momentum)}[optim_str]
+                if optim_str == 'adam':
+                    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+                else:
+                    optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=momentum)
 
                 ssp.train(edge_index, features, train_labels, val_labels, train_mask, val_mask,
                           model, optimizer, gamma, epochs, es_iters=es_iters, device=device, preconditioner=preconditioner)
                 return ssp.evaluate(edge_index, features, val_labels, val_mask, model, device=device)
 
-            optuna.logging.get_logger("optuna").addHandler(logging.StreamHandler(sys.stdout))
             study_name = "optuna-ssp"
             storage_name = "sqlite:///{}.db".format(study_name)
             study = optuna.create_study(direction='maximize', study_name=study_name, storage=storage_name, load_if_exists=True)
@@ -534,21 +594,38 @@ def main():
             print('Best score:', study.best_value)
             print('Best trial parameters:', study.best_trial.params)
         else:
-            hid_size = 32
-            dropout = 0.5
-            eps = 0.01
-            update_freq = 32
-            alpha = None
-            gamma = 5
-            lr = 0.001
-            weight_decay = 0.0005
-            momentum = 0.9
-            # precond_str = 'kfac'
-            precond_str = None
-            optim_str = 'adam'
-            # optim_str = 'sgd'
+            # {'hid_size': 314, 'dropout': 0.6472103883331131, 'eps': 0.8630152898396644, 'update_freq': 23, 'gamma': 1, 'lr': 0.006415024666683726, 'precond_str': None, 'optim_str': 'sgd', 'momentum': 0.5336515974069018, 'walk_length': 514, 'walk_p': 0.16588534869758617, 'walk_q': 0.4718316786929824}
+            params = {'hid_size': 314, 'dropout': 0.6472103883331131, 'eps': 1, 'update_freq': 23, 'gamma': 1, 'lr': 0.006415024666683726, 'precond_str': 'kfac', 'optim_str': 'adam', 'weight_decay': 5e-4, 'walk_length': 514, 'walk_p': 0.16588534869758617, 'walk_q': 0.4718316786929824, 'alpha': 1}
 
-            model = Net(in_size, hid_size, out_size, dropout)
+            hid_size = params['hid_size']
+            dropout = params['dropout']
+            eps = params['eps']
+            update_freq = params['update_freq']
+            alpha = params['alpha']
+            gamma = params['gamma']
+            lr = params['lr']
+            precond_str = 'kfac'
+            optim_str = 'adam'
+            if optim_str == 'adam':
+                weight_decay = params['weight_decay']
+            else:
+                momentum = params['momentum']
+
+            if node2vec:
+                walk_length = params['walk_length']
+                walk_p = params['walk_p']
+                walk_q = params['walk_q']
+
+                features = _features
+                walk_features = dgl.sampling.node2vec_random_walk(graph, graph.nodes(), walk_p, walk_q, walk_length=walk_length).type(torch.float32)  # (19717, walk_length+1)
+                features = torch.hstack((features, walk_features))
+                features = features_standardize(features)
+                in_size = features.shape[1]
+            else:
+                features = _features
+                in_size = features.shape[1]
+
+            model = ssp.Net(in_size, hid_size, out_size, dropout)
             model.to(device).reset_parameters()
 
             preconditioner = ssp.KFAC(
@@ -560,8 +637,10 @@ def main():
                 alpha=alpha if alpha is not None else 1.,
                 constraint_norm=False
             ) if precond_str == 'kfac' else None
-            optimizer = {'adam': torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay),
-                         'sgd': torch.optim.SGD(model.parameters(), lr=lr, momentum=momentum)}[optim_str]
+            if optim_str == 'adam':
+                optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+            else:
+                optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=momentum)
 
             ssp.train(edge_index, features, train_labels, val_labels, train_mask, val_mask,
                       model, optimizer, gamma, epochs, es_iters=es_iters, device=device, preconditioner=preconditioner)
@@ -572,9 +651,4 @@ def main():
         exit(1)
 
     if not tuning:
-        print("Export predictions as csv file.")
         write_output(indices)
-
-
-if __name__ == '__main__':
-    main()

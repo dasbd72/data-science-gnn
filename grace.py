@@ -63,11 +63,18 @@ class GCN(nn.Module):
         self.num_layers = num_layers
         self.convs = nn.ModuleList()
 
-        self.convs.append(dglnn.GraphConv(in_size, out_size * 2))
-        for _ in range(self.num_layers - 2):
-            self.convs.append(dglnn.GraphConv(out_size * 2, out_size * 2))
+        base_layer = dglnn.SAGEConv
 
-        self.convs.append(dglnn.GraphConv(out_size * 2, out_size))
+        if base_layer is dglnn.GraphConv:
+            self.convs.append(dglnn.GraphConv(in_size, out_size * 2))
+            for _ in range(self.num_layers - 2):
+                self.convs.append(dglnn.GraphConv(out_size * 2, out_size * 2))
+            self.convs.append(dglnn.GraphConv(out_size * 2, out_size))
+        elif base_layer is dglnn.SAGEConv:
+            self.convs.append(dglnn.SAGEConv(in_size, out_size * 2, "mean"))
+            for _ in range(self.num_layers - 2):
+                self.convs.append(dglnn.SAGEConv(out_size * 2, out_size * 2, "mean"))
+            self.convs.append(dglnn.SAGEConv(out_size * 2, out_size, "mean"))
         self.act_fn = act_fn
 
     def forward(self, graph, h):
@@ -103,58 +110,73 @@ class Grace(nn.Module):
         Number of the GNN encoder layers.
     act_fn: nn.Module
         Activation function.
-    temp: float
+    tau: float
         Temperature constant.
     """
 
-    def __init__(self, in_size, hid_size, out_size, num_layers, act_fn, temp):
+    def __init__(self, in_size, hid_size, out_size, num_layers, act_fn, tau):
         super(Grace, self).__init__()
         self.encoder = GCN(in_size, hid_size, act_fn, num_layers)
-        self.temp = temp
+        self.tau = tau
         self.proj = MLP(hid_size, out_size)
+
+    def forward(self, g, h: torch.Tensor) -> torch.Tensor:
+        return self.encoder(g, h)
+
+    def projection(self, z: torch.Tensor) -> torch.Tensor:
+        return self.proj(z)
 
     def sim(self, z1, z2):
         # normalize embeddings across features dimension
         z1 = F.normalize(z1)
         z2 = F.normalize(z2)
+        return torch.mm(z1, z2.t())
 
-        s = torch.mm(z1, z2.t())
-        return s
+    def semi_loss(self, z1: torch.Tensor, z2: torch.Tensor):
+        def f(x): return torch.exp(x / self.tau)
+        refl_sim = f(self.sim(z1, z1))
+        between_sim = f(self.sim(z1, z2))
 
-    def get_loss(self, z1, z2):
-        # calculate SimCLR loss
-        def f(x): return torch.exp(x / self.temp)
+        return -torch.log(
+            between_sim.diag()
+            / (refl_sim.sum(1) + between_sim.sum(1) - refl_sim.diag()))
 
-        refl_sim = f(self.sim(z1, z1))  # intra-view pairs
-        between_sim = f(self.sim(z1, z2))  # inter-view pairs
+    def batched_semi_loss(self, z1: torch.Tensor, z2: torch.Tensor, batch_size: int):
+        # Space complexity: O(BN) (semi_loss: O(N^2))
+        device = z1.device
+        num_nodes = z1.size(0)
+        num_batches = (num_nodes - 1) // batch_size + 1
+        def f(x): return torch.exp(x / self.tau)
+        indices = torch.arange(0, num_nodes).to(device)
+        losses = []
 
-        # between_sim.diag(): positive pairs
-        x1 = refl_sim.sum(1) + between_sim.sum(1) - refl_sim.diag()
-        loss = -torch.log(between_sim.diag() / x1)
+        for i in range(num_batches):
+            mask = indices[i * batch_size:(i + 1) * batch_size]
+            refl_sim = f(self.sim(z1[mask], z1))  # [B, N]
+            between_sim = f(self.sim(z1[mask], z2))  # [B, N]
 
-        return loss
+            losses.append(-torch.log(
+                between_sim[:, i * batch_size:(i + 1) * batch_size].diag()
+                / (refl_sim.sum(1) + between_sim.sum(1)
+                   - refl_sim[:, i * batch_size:(i + 1) * batch_size].diag())))
 
-    def get_embedding(self, graph, h):
-        # get embeddings from the model for evaluation
-        h = self.encoder(graph, h)
+        return torch.cat(losses)
 
-        return h.detach()
+    def loss(self, z1: torch.Tensor, z2: torch.Tensor, mean: bool = True, batch_size: int = 0):
+        h1 = self.projection(z1)
+        h2 = self.projection(z2)
 
-    def forward(self, g1, g2, h1, h2):
-        # encoding
-        h1 = self.encoder(g1, h1)
-        h2 = self.encoder(g2, h2)
+        if batch_size == 0:
+            l1 = self.semi_loss(h1, h2)
+            l2 = self.semi_loss(h2, h1)
+        else:
+            l1 = self.batched_semi_loss(h1, h2, batch_size)
+            l2 = self.batched_semi_loss(h2, h1, batch_size)
 
-        # projection
-        z1 = self.proj(h1)
-        z2 = self.proj(h2)
-
-        # get loss
-        l1 = self.get_loss(z1, z2)
-        l2 = self.get_loss(z2, z1)
         ret = (l1 + l2) * 0.5
+        ret = ret.mean() if mean else ret.sum()
 
-        return ret.mean()
+        return ret
 
 
 def get_classifier(X_train, y_train_hot):
@@ -171,14 +193,16 @@ def get_classifier(X_train, y_train_hot):
     return clf
 
 
-def predict(g: dgl.DGLGraph, features: torch.Tensor, train_labels: torch.Tensor, train_mask: torch.Tensor, test_mask: torch.Tensor, model: nn.Module, device: str = "cpu", info=False, proba=False):
+def predict(g: dgl.DGLGraph, features: torch.Tensor, train_labels: torch.Tensor, train_mask: torch.Tensor, test_mask: torch.Tensor, model: Grace, device: str = "cpu", info=False, proba=False):
     if info:
         print("Predicting...")
     # get embeddings
     g = g.add_self_loop()
     g = g.to(device)
     feat = features.to(device)
-    embeds = model.get_embedding(g, feat)
+    model.eval()
+    with torch.no_grad():
+        embeds = model(g, feat)
 
     # predict on embeddings
     X = embeds.detach().cpu().numpy()
@@ -198,14 +222,16 @@ def predict(g: dgl.DGLGraph, features: torch.Tensor, train_labels: torch.Tensor,
         return y_test_pred
 
 
-def evaluate(g: dgl.DGLGraph, features: torch.Tensor, train_labels: torch.Tensor, val_labels: torch.Tensor, train_mask: torch.Tensor, val_mask: torch.Tensor, model: nn.Module, device: str = "cpu", info=False):
+def evaluate(g: dgl.DGLGraph, features: torch.Tensor, train_labels: torch.Tensor, val_labels: torch.Tensor, train_mask: torch.Tensor, val_mask: torch.Tensor, model: Grace, device: str = "cpu", info=False):
     if info:
         print("Evaluating...")
     # get embeddings
     g = g.add_self_loop()
     g = g.to(device)
     feat = features.to(device)
-    embeds = model.get_embedding(g, feat)
+    model.eval()
+    with torch.no_grad():
+        embeds = model(g, feat)
 
     # predict on embeddings
     X = embeds.detach().cpu().numpy()
@@ -249,6 +275,8 @@ def gen_subgraph_lst(g: dgl.DGLGraph, features: torch.Tensor, batch_size: int, b
     """ 
     Generate mini batch of node masks
     """
+    g = g.to(device)
+    features = features.to(device)
     N = g.num_nodes()
     idx = torch.randint(0, N, (batches * batch_size, ), device=device)
     node_mask = torch.arange(0, N, device=device)[idx]
@@ -263,16 +291,13 @@ def gen_subgraph_lst(g: dgl.DGLGraph, features: torch.Tensor, batch_size: int, b
 
 
 def train(g: dgl.DGLGraph, features: torch.Tensor, train_labels: torch.Tensor, val_labels: torch.Tensor, train_mask: torch.Tensor, val_mask: torch.Tensor,
-          model: nn.Module, optimizer, epochs: int, batch_size: int, drop_feature_rate_1, drop_edge_rate_1, drop_feature_rate_2, drop_edge_rate_2, device: str = "cpu", info=False, pbar=True):
+          model: Grace, optimizer, epochs: int, batch_size: int, drop_feature_rate_1, drop_edge_rate_1, drop_feature_rate_2, drop_edge_rate_2, device: str = "cpu", info=False, pbar=True):
     """
     Training on minibatches of nodes(subgraphs)
     """
     if info:
         print("Training...")
 
-    g = g.to(device)
-    features = features.to(device)
-    train_labels = train_labels.to(device)
     if val_labels is not None:
         val_labels = val_labels.to(device)
     train_mask = train_mask.to(device)
@@ -282,25 +307,33 @@ def train(g: dgl.DGLGraph, features: torch.Tensor, train_labels: torch.Tensor, v
 
     epochs_progress = tqdm(total=epochs, desc='Epoch', disable=not pbar)
     train_log = tqdm(total=0, position=1, bar_format='{desc}', disable=not pbar)
+    if val_labels is not None and val_mask is not None:
+        acc_log = tqdm(total=0, position=2, bar_format='{desc}', disable=not pbar)
 
     subgraph_lst = gen_subgraph_lst(g, features, batch_size, 5 * math.ceil(g.num_nodes() / batch_size), device=device)
     for epoch in range(epochs):
         for subgraph, sub_features in random.choices(subgraph_lst, k=math.ceil(g.num_nodes() / batch_size)):
             model.train()
             optimizer.zero_grad()
-            graph1, features1 = aug(subgraph, sub_features, drop_feature_rate_1, drop_edge_rate_1)
-            graph2, features2 = aug(subgraph, sub_features, drop_feature_rate_2, drop_edge_rate_2)
+            g1, features1 = aug(subgraph, sub_features, drop_feature_rate_1, drop_edge_rate_1)
+            g2, features2 = aug(subgraph, sub_features, drop_feature_rate_2, drop_edge_rate_2)
 
-            graph1 = graph1.to(device)
-            graph2 = graph2.to(device)
+            g1 = g1.to(device)
+            g2 = g2.to(device)
 
             features1 = features1.to(device)
             features2 = features2.to(device)
 
-            loss = model(graph1, graph2, features1, features2)
+            z1 = model(g1, features1)
+            z2 = model(g2, features2)
+
+            loss = model.loss(z1, z2)
             loss.backward()
             optimizer.step()
 
+        if val_labels is not None and val_mask is not None and epoch % 10 == 0:
+            acc = evaluate(g, features, train_labels, val_labels, train_mask, val_mask, model, device=device)
+            acc_log.set_description_str("Accuracy {:.4f} ".format(acc))
         train_log.set_description_str("Current Epoch: {:05d} | Loss {:.4f} ".format(epoch, loss.item()))
         epochs_progress.update()
 
@@ -308,4 +341,5 @@ def train(g: dgl.DGLGraph, features: torch.Tensor, train_labels: torch.Tensor, v
     train_log.close()
     if val_labels is not None and val_mask is not None:
         acc = evaluate(g, features, train_labels, val_labels, train_mask, val_mask, model, device=device)
-        print("Accuracy {:.4f}".format(acc))
+        acc_log.set_description_str("Accuracy {:.4f}".format(acc))
+        acc_log.close()
