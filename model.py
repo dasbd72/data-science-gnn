@@ -6,8 +6,6 @@ import dgl
 import dgl.function as fn
 import dgl.nn.pytorch as dglnn
 
-from torch_geometric.nn import GCNConv
-
 
 class GCN(nn.Module):
     """

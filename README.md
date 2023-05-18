@@ -29,7 +29,6 @@ dataset should be in `./dataset`
     * GCN
     * SAGE
     * Grace
-    * SSP
   * Best model is Grace
 
 ### Examples

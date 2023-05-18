@@ -20,47 +20,26 @@ import random
 
 # === Graph Augmentation ==================================================================
 def aug(graph, features, feat_drop_rate, edge_mask_rate) -> tuple[dgl.DGLGraph, torch.Tensor]:
-    n_node = graph.num_nodes()
-
-    edge_mask = mask_edge(graph, edge_mask_rate)
-    feat = drop_feature(features, feat_drop_rate)
+    edge_mask = torch.bernoulli(1 - torch.FloatTensor(np.ones(graph.num_edges()) * edge_mask_rate)).nonzero().squeeze(1)
 
     src = graph.edges()[0]
     dst = graph.edges()[1]
 
-    nsrc = src[edge_mask]
-    ndst = dst[edge_mask]
+    g = dgl.graph((src[edge_mask], dst[edge_mask]), num_nodes=graph.num_nodes())
+    g = g.add_self_loop()
 
-    ng = dgl.graph((nsrc, ndst), num_nodes=n_node)
-    ng = ng.add_self_loop()
-
-    return ng, feat
-
-
-def drop_feature(features, drop_prob):
-    drop_mask = (torch.empty((features.size(1),), dtype=torch.float32, device=features.device).uniform_(0, 1) < drop_prob)
-    feat = features.clone()
-    feat[:, drop_mask] = 0
-
-    return feat
-
-
-def mask_edge(graph, mask_prob):
-    E = graph.num_edges()
-
-    mask_rates = torch.FloatTensor(np.ones(E) * mask_prob)
-    masks = torch.bernoulli(1 - mask_rates)
-    mask_idx = masks.nonzero().squeeze(1)
-    return mask_idx
+    drop_mask = (torch.empty((features.size(1),), dtype=torch.float32, device=features.device).uniform_(0, 1) < feat_drop_rate)
+    f = features.clone()
+    f[:, drop_mask] = 0
+    return g, f
 
 
 # === Model ==================================================================
 class GCN(nn.Module):
     def __init__(self, in_size, out_size, act_fn, num_layers=2):
         super(GCN, self).__init__()
-        assert num_layers >= 2
-
         self.num_layers = num_layers
+        self.act_fn = act_fn
         self.convs = nn.ModuleList()
 
         base_layer = dglnn.SAGEConv
@@ -75,11 +54,11 @@ class GCN(nn.Module):
             for _ in range(self.num_layers - 2):
                 self.convs.append(dglnn.SAGEConv(out_size * 2, out_size * 2, "mean"))
             self.convs.append(dglnn.SAGEConv(out_size * 2, out_size, "mean"))
-        self.act_fn = act_fn
 
-    def forward(self, graph, h):
+    def forward(self, g, h):
         for i in range(self.num_layers):
-            h = self.act_fn(self.convs[i](graph, h))
+            h = self.convs[i](g, h)
+            h = self.act_fn(h)
         return h
 
 
@@ -96,24 +75,6 @@ class MLP(nn.Module):
 
 
 class Grace(nn.Module):
-    r"""
-        GRACE model
-    Parameters
-    -----------
-    in_size: int
-        Input features size.
-    hid_size: int
-        Hidden features size.
-    out_size: int
-        Output features size.
-    num_layers: int
-        Number of the GNN encoder layers.
-    act_fn: nn.Module
-        Activation function.
-    tau: float
-        Temperature constant.
-    """
-
     def __init__(self, in_size, hid_size, out_size, num_layers, act_fn, tau):
         super(Grace, self).__init__()
         self.encoder = GCN(in_size, hid_size, act_fn, num_layers)
@@ -123,74 +84,38 @@ class Grace(nn.Module):
     def forward(self, g, h: torch.Tensor) -> torch.Tensor:
         return self.encoder(g, h)
 
-    def projection(self, z: torch.Tensor) -> torch.Tensor:
-        return self.proj(z)
+    def sim(self, h1, h2):
+        return torch.mm(F.normalize(h1), F.normalize(h2).t())
 
-    def sim(self, z1, z2):
-        # normalize embeddings across features dimension
-        z1 = F.normalize(z1)
-        z2 = F.normalize(z2)
-        return torch.mm(z1, z2.t())
+    def semi_loss(self, h1: torch.Tensor, h2: torch.Tensor):
+        refl_sim = torch.exp(self.sim(h1, h1) / self.tau)
+        between_sim = torch.exp(self.sim(h1, h2) / self.tau)
+        return -torch.log(between_sim.diag() / (refl_sim.sum(1) + between_sim.sum(1) - refl_sim.diag()))
 
-    def semi_loss(self, z1: torch.Tensor, z2: torch.Tensor):
-        def f(x): return torch.exp(x / self.tau)
-        refl_sim = f(self.sim(z1, z1))
-        between_sim = f(self.sim(z1, z2))
+    def loss(self, h1: torch.Tensor, h2: torch.Tensor):
+        h1 = self.proj(h1)
+        h2 = self.proj(h2)
 
-        return -torch.log(
-            between_sim.diag()
-            / (refl_sim.sum(1) + between_sim.sum(1) - refl_sim.diag()))
-
-    def batched_semi_loss(self, z1: torch.Tensor, z2: torch.Tensor, batch_size: int):
-        # Space complexity: O(BN) (semi_loss: O(N^2))
-        device = z1.device
-        num_nodes = z1.size(0)
-        num_batches = (num_nodes - 1) // batch_size + 1
-        def f(x): return torch.exp(x / self.tau)
-        indices = torch.arange(0, num_nodes).to(device)
-        losses = []
-
-        for i in range(num_batches):
-            mask = indices[i * batch_size:(i + 1) * batch_size]
-            refl_sim = f(self.sim(z1[mask], z1))  # [B, N]
-            between_sim = f(self.sim(z1[mask], z2))  # [B, N]
-
-            losses.append(-torch.log(
-                between_sim[:, i * batch_size:(i + 1) * batch_size].diag()
-                / (refl_sim.sum(1) + between_sim.sum(1)
-                   - refl_sim[:, i * batch_size:(i + 1) * batch_size].diag())))
-
-        return torch.cat(losses)
-
-    def loss(self, z1: torch.Tensor, z2: torch.Tensor, mean: bool = True, batch_size: int = 0):
-        h1 = self.projection(z1)
-        h2 = self.projection(z2)
-
-        if batch_size == 0:
-            l1 = self.semi_loss(h1, h2)
-            l2 = self.semi_loss(h2, h1)
-        else:
-            l1 = self.batched_semi_loss(h1, h2, batch_size)
-            l2 = self.batched_semi_loss(h2, h1, batch_size)
+        l1 = self.semi_loss(h1, h2)
+        l2 = self.semi_loss(h2, h1)
 
         ret = (l1 + l2) * 0.5
-        ret = ret.mean() if mean else ret.sum()
-
+        ret = ret.mean()
         return ret
 
 
 def get_classifier(X_train, y_train_hot):
     logreg = LogisticRegression(solver="liblinear")
     c = 1.4 ** np.arange(-20, 20)
-    clf = GridSearchCV(
+    classifier = GridSearchCV(
         estimator=OneVsRestClassifier(logreg),
         param_grid=dict(estimator__C=c),
         n_jobs=8,
         cv=10,
         verbose=0,
     )
-    clf.fit(X_train, y_train_hot)
-    return clf
+    classifier.fit(X_train, y_train_hot)
+    return classifier
 
 
 def predict(g: dgl.DGLGraph, features: torch.Tensor, train_labels: torch.Tensor, train_mask: torch.Tensor, test_mask: torch.Tensor, model: Grace, device: str = "cpu", info=False, proba=False):
@@ -213,12 +138,12 @@ def predict(g: dgl.DGLGraph, features: torch.Tensor, train_labels: torch.Tensor,
     y_train = train_labels.detach().cpu().numpy().reshape(-1, 1)
     y_train_hot = OneHotEncoder(categories="auto").fit_transform(y_train).toarray().astype(np.bool)
 
-    clf = get_classifier(X_train, y_train_hot)
+    classifier = get_classifier(X_train, y_train_hot)
 
     if proba:
-        return clf.predict_proba(X_test)
+        return classifier.predict_proba(X_test)
     else:
-        y_test_pred = clf.predict_proba(X_test).argmax(axis=1).astype(np.int64)
+        y_test_pred = classifier.predict_proba(X_test).argmax(axis=1).astype(np.int64)
         return y_test_pred
 
 
@@ -243,9 +168,9 @@ def evaluate(g: dgl.DGLGraph, features: torch.Tensor, train_labels: torch.Tensor
     y_val = val_labels.detach().cpu().numpy().reshape(-1, 1)
     y_train_hot = OneHotEncoder(categories="auto").fit_transform(y_train).toarray().astype(np.bool)
 
-    clf = get_classifier(X_train, y_train_hot)
+    classifier = get_classifier(X_train, y_train_hot)
 
-    y_val_pred = clf.predict_proba(X_val).argmax(axis=1).astype(np.int64)
+    y_val_pred = classifier.predict_proba(X_val).argmax(axis=1).astype(np.int64)
     return accuracy_score(y_val, y_val_pred)
 
 
@@ -253,16 +178,6 @@ def gen_node_mask_lst(g: dgl.DGLGraph, batch_size: int, device: str = 'cpu'):
     """ 
     Generate mini batch of node masks
     """
-    # N = g.num_nodes()
-    # idx = torch.randperm(N)
-    # node_mask = torch.arange(0, N)[idx]
-    # node_mask_lst = []
-    # for i in range(0, N, batch_size):
-    #     if i + batch_size > N:
-    #         node_mask_lst.append(node_mask[i:N])
-    #     else:
-    #         node_mask_lst.append(node_mask[i:i+batch_size])
-
     N = g.num_nodes()
     node_mask_lst = []
     for i in range(0, N, batch_size):
@@ -324,10 +239,10 @@ def train(g: dgl.DGLGraph, features: torch.Tensor, train_labels: torch.Tensor, v
             features1 = features1.to(device)
             features2 = features2.to(device)
 
-            z1 = model(g1, features1)
-            z2 = model(g2, features2)
+            h1 = model(g1, features1)
+            h2 = model(g2, features2)
 
-            loss = model.loss(z1, z2)
+            loss = model.loss(h1, h2)
             loss.backward()
             optimizer.step()
 
