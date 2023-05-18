@@ -12,6 +12,13 @@ mkdir -p outputs
 
 dataset should be in `./dataset`
 
+```bash=
+cd sample
+unzip sample_code_and_dataset.zip
+cd ..
+mv sample/dataset/ dataset
+```
+
 ### Parameters
 
 * --use_gpu
@@ -31,7 +38,7 @@ dataset should be in `./dataset`
     * Grace
   * Best model is Grace
 
-### Examples
+### Training
 
 To tune variables (also generates ./outputs/output_\[val_acc\].csv)
 
